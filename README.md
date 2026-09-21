@@ -17,7 +17,8 @@ MCP (Model Context Protocol) server that gives Claude direct access to the FINIS
 `count_only`.
 | `get_table_schema` | Inspect field names, types, and a sample record |
 | `search_by_square` | Filter XYZ records by excavation square |
-| `summary_stats` | Quick overview: record counts, squares, coordinate ranges |
+| `list_squares` | Distinct square ids for a site, optionally filtered by unit |
+| `summary_stats` | Quick overview: record counts, units, coordinate ranges |
 
 Sites: **esc** (Escoural), **gdc** (Gruta da Companheira), **cari** (Carigüela)
 
@@ -38,6 +39,19 @@ tracking offsets yourself:
 get_xyz("esc", limit=500)            -> next_offset: 500, has_more: true
 get_xyz("esc", limit=500, offset=500) -> next_offset: 1000, has_more: true
 ```
+
+`summary_stats` reports `n_squares` but not the ids themselves — inlining several
+thousand of them used to overflow the response limit and made the tool unusable for
+ESC and CARI. Use `list_squares` for the ids, which pages like any other table and
+takes an optional `unit` filter:
+
+```
+list_squares("gdc", count_only=True)   -> total_records: 2060
+list_squares("gdc", unit="N19")        -> 421 squares, N19-1, N19-10, ...
+```
+
+Likewise `summary_stats` lists datum *names* only; `get_datums` returns their
+coordinates.
 
 Use `count_only=True` to size a table before pulling it — it returns just the counts,
 no rows. On `get_site_data` it also reports join coverage

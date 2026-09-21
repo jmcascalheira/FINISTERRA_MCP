@@ -496,6 +496,67 @@ async def search_by_square(site: str, square_id: str) -> str:
 
 
 @mcp.tool()
+async def list_squares(
+    site: str,
+    unit: str | None = None,
+    limit: int = 500,
+    offset: int = 0,
+    count_only: bool = False,
+) -> str:
+    """
+    List the distinct excavation squares (squid values) recorded for a site.
+
+    summary_stats reports how many squares a site has but not which ones, because
+    inlining several thousand ids overflows the response limit. Use this to get
+    the ids themselves, a page at a time.
+
+    Args:
+        site: Site code — 'esc', 'gdc', or 'cari'
+        unit: Optional unit code to filter by (e.g. 'N19'), case-insensitive
+        limit: Max squares to return (default 500, use 0 for all)
+        offset: Number of squares to skip for pagination
+        count_only: Return just the number of distinct squares, no ids
+
+    Note: total_records counts distinct squares here, not XYZ rows.
+    """
+    state: AppState = mcp.get_context().request_context.lifespan_context
+    err = _validate_site(site) or _validate_paging(limit, offset)
+    if err:
+        return err
+
+    try:
+        data = await _fetch_table(state, f"{site.lower()}/xyz/list/")
+        if isinstance(data, dict) and "error" in data:
+            return data["error"]
+        if not isinstance(data, list):
+            return json.dumps(data, indent=2)
+
+        rows = data
+        if unit:
+            wanted = unit.strip().lower()
+            rows = [r for r in data if str(r.get("unit", "")).lower() == wanted]
+            if not rows:
+                known = sorted({str(r.get("unit")) for r in data if r.get("unit")})
+                return (
+                    f"No squares found for unit '{unit}' at {site.lower()}. "
+                    f"Known units: {', '.join(known)}"
+                )
+
+        squares = sorted({str(r.get("squid")) for r in rows if r.get("squid")})
+
+        result = _paged_result(site.lower(), "squares", squares, limit, offset, count_only)
+        if "data" in result:
+            result["squares"] = result.pop("data")
+        if unit:
+            result["unit_filter"] = unit
+        return json.dumps(result, indent=2, default=str)
+    except httpx.HTTPStatusError as e:
+        return f"HTTP error {e.response.status_code}: {e.response.text}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
 async def summary_stats(site: str) -> str:
     """
     Get a quick summary of a site's data: record counts, list of squares,
@@ -519,10 +580,12 @@ async def summary_stats(site: str) -> str:
             "site_name": KNOWN_SITES.get(site.lower(), "Unknown"),
         }
 
-        # XYZ stats
+        # XYZ stats. The square ids are deliberately not inlined: sites have
+        # thousands of them, which overflows the response limit and made this
+        # tool unusable for ESC and CARI. Use list_squares for the ids.
         if isinstance(xyz_data, list) and xyz_data:
-            squares = sorted(set(str(r.get("squid", "")) for r in xyz_data if r.get("squid")))
-            units = sorted(set(str(r.get("unit", "")) for r in xyz_data if r.get("unit")))
+            squares = {str(r.get("squid", "")) for r in xyz_data if r.get("squid")}
+            units = sorted({str(r.get("unit", "")) for r in xyz_data if r.get("unit")})
 
             xs = [r["x"] for r in xyz_data if r.get("x") is not None]
             ys = [r["y"] for r in xyz_data if r.get("y") is not None]
@@ -530,10 +593,10 @@ async def summary_stats(site: str) -> str:
 
             summary["xyz"] = {
                 "total_records": len(xyz_data),
-                "squares": squares,
                 "n_squares": len(squares),
                 "units": units,
                 "n_units": len(units),
+                "squares_hint": f"Use list_squares('{site.lower()}') for the {len(squares)} square ids.",
             }
             if xs:
                 summary["xyz"]["x_range"] = [min(xs), max(xs)]
@@ -550,9 +613,13 @@ async def summary_stats(site: str) -> str:
         else:
             summary["context"] = {"total_records": 0}
 
-        # Datums stats
+        # Datums stats: names only; get_datums returns the coordinates.
         if isinstance(datum_data, list):
-            summary["datums"] = {"total_records": len(datum_data), "data": datum_data}
+            summary["datums"] = {
+                "total_records": len(datum_data),
+                "names": [str(d.get("name")) for d in datum_data if d.get("name")],
+                "data_hint": f"Use get_datums('{site.lower()}') for datum coordinates.",
+            }
         else:
             summary["datums"] = {"total_records": 0}
 
