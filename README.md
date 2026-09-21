@@ -53,6 +53,29 @@ list_squares("gdc", unit="N19")        -> 421 squares, N19-1, N19-10, ...
 Likewise `summary_stats` lists datum *names* only; `get_datums` returns their
 coordinates.
 
+## Marker records
+
+Some records document excavation infrastructure rather than recovered material:
+those coded `PHOTO`, `TOPOGRAPHY`, `TOPO` or `POINT`. Pass `exclude_markers=True` to
+`get_xyz`, `get_context`, `get_site_data`, `list_squares` or `summary_stats` to leave
+them out of the counts. It defaults to off, so raw counts are unchanged.
+
+| Site | rows (raw → filtered) | squares (raw → filtered) |
+|---|---|---|
+| ESC | 8,409 → 8,228 | 5,360 → 5,295 |
+| GDC | 3,005 → 2,956 | 2,060 → 2,051 |
+| CARI | 6,959 → 6,518 | 5,694 → 5,584 |
+
+The filter keys on the **record code, not the unit**. That matters: units that hold
+nothing but photo or survey shots (ESC `Q`, `T`, `ProfN/E/S/Nb/Es`, `N26Prof`; CARI
+`trbackN/E`, `treast`, `triang`, `PdeepS/W/E`) drop out on their own, while
+non-grid units that hold genuine material are kept — CARI's `corte1`/`corte2` retain
+their OSL, ochre, sediment and lithic samples, and GDC's `X` keeps its stratigraphy.
+Filtering by unit name instead would discard 327 real records across the three sites.
+
+XYZ rows with no matching context record are kept: an unmatched row is a recording
+gap, not evidence that the row is infrastructure.
+
 Use `count_only=True` to size a table before pulling it — it returns just the counts,
 no rows. On `get_site_data` it also reports join coverage
 (`joined_with_context` / `missing_context`):

@@ -43,6 +43,12 @@ KNOWN_TABLES = ["xyz", "context", "datums"]
 # paged read costs one HTTP fetch instead of one per page.
 CACHE_TTL = float(os.environ.get("FINISTERRA_CACHE_TTL", "300"))
 
+# Context codes that record excavation infrastructure rather than recovered
+# material: photo markers, topographic shots and survey points. Filtering on the
+# record code rather than the unit keeps genuine samples that happen to sit in a
+# profile or section unit (CARI's corte1/corte2 hold OSL, ochre and lithics).
+MARKER_CODES = {"PHOTO", "TOPOGRAPHY", "TOPO", "POINT"}
+
 logger = logging.getLogger("finisterra-mcp")
 
 # ---------------------------------------------------------------------------
@@ -143,6 +149,40 @@ async def _fetch_table(state: AppState, path: str, refresh: bool = False) -> Any
     if isinstance(data, list) and CACHE_TTL > 0:
         state.cache[path] = (now, data)
     return data
+
+
+def _is_marker_code(code: Any) -> bool:
+    """True if a context code records infrastructure rather than material."""
+    return str(code or "").strip().upper() in MARKER_CODES
+
+
+def _context_lookup(ctx_data: Any) -> dict[tuple, dict]:
+    """Index context rows by their (squid, unit, idno) join key."""
+    if not isinstance(ctx_data, list):
+        return {}
+    return {(r.get("squid"), r.get("unit"), r.get("idno")): r for r in ctx_data}
+
+
+def _drop_markers(rows: list, ctx_lookup: dict[tuple, dict]) -> list:
+    """Drop XYZ rows whose joined context record is a marker.
+
+    Rows with no context match are kept: an unmatched row is a recording gap,
+    not evidence that the row is infrastructure.
+    """
+    kept = []
+    for r in rows:
+        ctx = ctx_lookup.get((r.get("squid"), r.get("unit"), r.get("idno")))
+        if ctx is not None and _is_marker_code(ctx.get("code")):
+            continue
+        kept.append(r)
+    return kept
+
+
+async def _xyz_without_markers(state: AppState, site: str, rows: list) -> tuple[list, int]:
+    """Return (rows with markers dropped, number dropped)."""
+    ctx_data = await _fetch_table(state, f"{site}/context/list/")
+    kept = _drop_markers(rows, _context_lookup(ctx_data))
+    return kept, len(rows) - len(kept)
 
 
 def _paged_result(
@@ -252,7 +292,11 @@ async def list_sites() -> str:
 
 @mcp.tool()
 async def get_xyz(
-    site: str, limit: int = 100, offset: int = 0, count_only: bool = False
+    site: str,
+    limit: int = 100,
+    offset: int = 0,
+    count_only: bool = False,
+    exclude_markers: bool = False,
 ) -> str:
     """
     Get XYZ coordinate data for a site.
@@ -263,6 +307,8 @@ async def get_xyz(
         offset: Number of records to skip for pagination
         count_only: Return just the record count, no data. Cheap way to size a
             table before pulling it.
+        exclude_markers: Drop records coded PHOTO/TOPOGRAPHY/POINT, which record
+            excavation infrastructure rather than recovered material.
     """
     state: AppState = mcp.get_context().request_context.lifespan_context
     err = _validate_site(site) or _validate_paging(limit, offset)
@@ -276,7 +322,13 @@ async def get_xyz(
         if not isinstance(data, list):
             return json.dumps(data, indent=2)
 
+        dropped = 0
+        if exclude_markers:
+            data, dropped = await _xyz_without_markers(state, site.lower(), data)
+
         result = _paged_result(site.lower(), "xyz", data, limit, offset, count_only)
+        if exclude_markers:
+            result["markers_excluded"] = dropped
         return json.dumps(result, indent=2, default=str)
     except httpx.HTTPStatusError as e:
         return f"HTTP error {e.response.status_code}: {e.response.text}"
@@ -286,7 +338,11 @@ async def get_xyz(
 
 @mcp.tool()
 async def get_context(
-    site: str, limit: int = 100, offset: int = 0, count_only: bool = False
+    site: str,
+    limit: int = 100,
+    offset: int = 0,
+    count_only: bool = False,
+    exclude_markers: bool = False,
 ) -> str:
     """
     Get context/find data for a site.
@@ -297,6 +353,8 @@ async def get_context(
         offset: Number of records to skip for pagination
         count_only: Return just the record count, no data. Cheap way to size a
             table before pulling it.
+        exclude_markers: Drop records coded PHOTO/TOPOGRAPHY/POINT, which record
+            excavation infrastructure rather than recovered material.
     """
     state: AppState = mcp.get_context().request_context.lifespan_context
     err = _validate_site(site) or _validate_paging(limit, offset)
@@ -310,7 +368,15 @@ async def get_context(
         if not isinstance(data, list):
             return json.dumps(data, indent=2)
 
+        dropped = 0
+        if exclude_markers:
+            before = len(data)
+            data = [r for r in data if not _is_marker_code(r.get("code"))]
+            dropped = before - len(data)
+
         result = _paged_result(site.lower(), "context", data, limit, offset, count_only)
+        if exclude_markers:
+            result["markers_excluded"] = dropped
         return json.dumps(result, indent=2, default=str)
     except httpx.HTTPStatusError as e:
         return f"HTTP error {e.response.status_code}: {e.response.text}"
@@ -351,7 +417,11 @@ async def get_datums(site: str) -> str:
 
 @mcp.tool()
 async def get_site_data(
-    site: str, limit: int = 100, offset: int = 0, count_only: bool = False
+    site: str,
+    limit: int = 100,
+    offset: int = 0,
+    count_only: bool = False,
+    exclude_markers: bool = False,
 ) -> str:
     """
     Get combined XYZ + Context data for a site (left join on squid, unit, idno).
@@ -364,6 +434,8 @@ async def get_site_data(
         count_only: Return row counts and join coverage only, no data. The full
             join is far too large to return in one response, so use this first
             to size the pull.
+        exclude_markers: Drop records coded PHOTO/TOPOGRAPHY/POINT, which record
+            excavation infrastructure rather than recovered material.
     """
     state: AppState = mcp.get_context().request_context.lifespan_context
     err = _validate_site(site) or _validate_paging(limit, offset)
@@ -386,27 +458,35 @@ async def get_site_data(
                 key = (row.get("squid"), row.get("unit"), row.get("idno"))
                 ctx_lookup[key] = row
 
+        rows = xyz_data if isinstance(xyz_data, list) else []
+        dropped = 0
+        if exclude_markers:
+            before = len(rows)
+            rows = _drop_markers(rows, ctx_lookup)
+            dropped = before - len(rows)
+
         # Left join: xyz as base, merge context fields
         combined = []
         matched = 0
-        if isinstance(xyz_data, list):
-            for row in xyz_data:
-                key = (row.get("squid"), row.get("unit"), row.get("idno"))
-                merged = {**row}
-                if key in ctx_lookup:
-                    matched += 1
-                    for k, v in ctx_lookup[key].items():
-                        if k not in merged:
-                            merged[k] = v
-                combined.append(merged)
+        for row in rows:
+            key = (row.get("squid"), row.get("unit"), row.get("idno"))
+            merged = {**row}
+            if key in ctx_lookup:
+                matched += 1
+                for k, v in ctx_lookup[key].items():
+                    if k not in merged:
+                        merged[k] = v
+            combined.append(merged)
 
         result = _paged_result(
             site.lower(), "xyz + context (joined)", combined, limit, offset, count_only
         )
-        result["xyz_records"] = len(xyz_data) if isinstance(xyz_data, list) else 0
+        result["xyz_records"] = len(rows)
         result["context_records"] = len(ctx_data) if isinstance(ctx_data, list) else 0
         result["joined_with_context"] = matched
         result["missing_context"] = len(combined) - matched
+        if exclude_markers:
+            result["markers_excluded"] = dropped
         return json.dumps(result, indent=2, default=str)
     except httpx.HTTPStatusError as e:
         return f"HTTP error {e.response.status_code}: {e.response.text}"
@@ -502,6 +582,7 @@ async def list_squares(
     limit: int = 500,
     offset: int = 0,
     count_only: bool = False,
+    exclude_markers: bool = False,
 ) -> str:
     """
     List the distinct excavation squares (squid values) recorded for a site.
@@ -516,6 +597,9 @@ async def list_squares(
         limit: Max squares to return (default 500, use 0 for all)
         offset: Number of squares to skip for pagination
         count_only: Return just the number of distinct squares, no ids
+        exclude_markers: Ignore records coded PHOTO/TOPOGRAPHY/POINT when
+            collecting squares. Squares recorded only by a photo or survey shot
+            drop out entirely, which removes the pure-marker profile units.
 
     Note: total_records counts distinct squares here, not XYZ rows.
     """
@@ -532,6 +616,10 @@ async def list_squares(
             return json.dumps(data, indent=2)
 
         rows = data
+        dropped = 0
+        if exclude_markers:
+            rows, dropped = await _xyz_without_markers(state, site.lower(), rows)
+            data = rows
         if unit:
             wanted = unit.strip().lower()
             rows = [r for r in data if str(r.get("unit", "")).lower() == wanted]
@@ -549,6 +637,8 @@ async def list_squares(
             result["squares"] = result.pop("data")
         if unit:
             result["unit_filter"] = unit
+        if exclude_markers:
+            result["marker_records_ignored"] = dropped
         return json.dumps(result, indent=2, default=str)
     except httpx.HTTPStatusError as e:
         return f"HTTP error {e.response.status_code}: {e.response.text}"
@@ -557,13 +647,17 @@ async def list_squares(
 
 
 @mcp.tool()
-async def summary_stats(site: str) -> str:
+async def summary_stats(site: str, exclude_markers: bool = False) -> str:
     """
-    Get a quick summary of a site's data: record counts, list of squares,
-    coordinate ranges, etc.
+    Get a quick summary of a site's data: record counts, units, coordinate
+    ranges, etc. Use list_squares for the square ids themselves.
 
     Args:
         site: Site code — 'esc', 'gdc', or 'cari'
+        exclude_markers: Drop records coded PHOTO/TOPOGRAPHY/POINT, which record
+            excavation infrastructure rather than recovered material. Units that
+            contain nothing else (profile and survey-point units) disappear from
+            the summary entirely.
     """
     state: AppState = mcp.get_context().request_context.lifespan_context
     err = _validate_site(site)
@@ -579,6 +673,20 @@ async def summary_stats(site: str) -> str:
             "site": site.lower(),
             "site_name": KNOWN_SITES.get(site.lower(), "Unknown"),
         }
+
+        if exclude_markers:
+            n_xyz = len(xyz_data) if isinstance(xyz_data, list) else 0
+            n_ctx = len(ctx_data) if isinstance(ctx_data, list) else 0
+            if isinstance(xyz_data, list):
+                xyz_data = _drop_markers(xyz_data, _context_lookup(ctx_data))
+            if isinstance(ctx_data, list):
+                ctx_data = [r for r in ctx_data if not _is_marker_code(r.get("code"))]
+            summary["exclude_markers"] = True
+            summary["markers_excluded"] = {
+                "xyz": n_xyz - (len(xyz_data) if isinstance(xyz_data, list) else 0),
+                "context": n_ctx - (len(ctx_data) if isinstance(ctx_data, list) else 0),
+                "codes": sorted(MARKER_CODES),
+            }
 
         # XYZ stats. The square ids are deliberately not inlined: sites have
         # thousands of them, which overflows the response limit and made this
@@ -596,7 +704,11 @@ async def summary_stats(site: str) -> str:
                 "n_squares": len(squares),
                 "units": units,
                 "n_units": len(units),
-                "squares_hint": f"Use list_squares('{site.lower()}') for the {len(squares)} square ids.",
+                "squares_hint": (
+                    f"Use list_squares('{site.lower()}'"
+                    + (", exclude_markers=True" if exclude_markers else "")
+                    + f") for the {len(squares)} square ids."
+                ),
             }
             if xs:
                 summary["xyz"]["x_range"] = [min(xs), max(xs)]
