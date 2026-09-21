@@ -15,6 +15,7 @@ Authentication via environment variables:
 
 import os
 import json
+import time
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -37,6 +38,11 @@ KNOWN_SITES = {
 
 KNOWN_TABLES = ["xyz", "context", "datums"]
 
+# The upstream API ignores limit/offset/page query params and always returns the
+# full table, so slicing has to happen here. Caching the fetched table means a
+# paged read costs one HTTP fetch instead of one per page.
+CACHE_TTL = float(os.environ.get("FINISTERRA_CACHE_TTL", "300"))
+
 logger = logging.getLogger("finisterra-mcp")
 
 # ---------------------------------------------------------------------------
@@ -45,9 +51,11 @@ logger = logging.getLogger("finisterra-mcp")
 
 @dataclass
 class AppState:
-    """Holds the authenticated token and HTTP client."""
+    """Holds the authenticated token, HTTP client, and fetched-table cache."""
     token: str | None = None
     client: httpx.AsyncClient | None = None
+    # path -> (fetched_at_monotonic, rows)
+    cache: dict[str, tuple[float, Any]] = field(default_factory=dict)
 
 
 @asynccontextmanager
@@ -118,6 +126,64 @@ async def _authed_get(state: AppState, path: str) -> Any:
     return resp.json()
 
 
+async def _fetch_table(state: AppState, path: str, refresh: bool = False) -> Any:
+    """Fetch a list endpoint, serving from cache when the entry is still fresh.
+
+    The API has no pagination, so every call would otherwise re-download the
+    whole table. Only list responses are cached; errors are passed straight
+    through so they are never sticky.
+    """
+    now = time.monotonic()
+    if not refresh and CACHE_TTL > 0:
+        hit = state.cache.get(path)
+        if hit is not None and (now - hit[0]) < CACHE_TTL:
+            return hit[1]
+
+    data = await _authed_get(state, path)
+    if isinstance(data, list) and CACHE_TTL > 0:
+        state.cache[path] = (now, data)
+    return data
+
+
+def _paged_result(
+    site: str,
+    table: str,
+    data: list,
+    limit: int,
+    offset: int,
+    count_only: bool,
+) -> dict:
+    """Build a paginated response envelope over an already-fetched table."""
+    total = len(data)
+    if count_only:
+        return {"site": site, "table": table, "total_records": total}
+
+    offset = max(0, offset)
+    subset = data[offset:] if limit == 0 else data[offset : offset + limit]
+    next_offset = offset + len(subset)
+    has_more = next_offset < total
+
+    return {
+        "site": site,
+        "table": table,
+        "total_records": total,
+        "offset": offset,
+        "returned": len(subset),
+        "has_more": has_more,
+        "next_offset": next_offset if has_more else None,
+        "data": subset,
+    }
+
+
+def _validate_paging(limit: int, offset: int) -> str | None:
+    """Return an error message for out-of-range paging args, else None."""
+    if limit < 0:
+        return f"Invalid limit {limit}. Use a positive number, or 0 for all records."
+    if offset < 0:
+        return f"Invalid offset {offset}. Offset must be 0 or greater."
+    return None
+
+
 def _truncated(data: list[dict], limit: int = 100) -> dict:
     """Return data with optional truncation info for large result sets."""
     total = len(data)
@@ -161,6 +227,8 @@ async def authenticate(username: str, password: str) -> str:
         )
         resp.raise_for_status()
         state.token = resp.json()["token"]
+        # A new identity may see different rows; don't serve the old one's cache.
+        state.cache.clear()
         return f"Authenticated successfully as {username}."
     except httpx.HTTPStatusError as e:
         return f"Authentication failed: HTTP {e.response.status_code}"
@@ -183,7 +251,9 @@ async def list_sites() -> str:
 
 
 @mcp.tool()
-async def get_xyz(site: str, limit: int = 100, offset: int = 0) -> str:
+async def get_xyz(
+    site: str, limit: int = 100, offset: int = 0, count_only: bool = False
+) -> str:
     """
     Get XYZ coordinate data for a site.
 
@@ -191,33 +261,22 @@ async def get_xyz(site: str, limit: int = 100, offset: int = 0) -> str:
         site: Site code — 'esc', 'gdc', or 'cari'
         limit: Max records to return (default 100, use 0 for all)
         offset: Number of records to skip for pagination
+        count_only: Return just the record count, no data. Cheap way to size a
+            table before pulling it.
     """
     state: AppState = mcp.get_context().request_context.lifespan_context
-    err = _validate_site(site)
+    err = _validate_site(site) or _validate_paging(limit, offset)
     if err:
         return err
 
     try:
-        data = await _authed_get(state, f"{site.lower()}/xyz/list/")
+        data = await _fetch_table(state, f"{site.lower()}/xyz/list/")
         if isinstance(data, dict) and "error" in data:
             return data["error"]
         if not isinstance(data, list):
             return json.dumps(data, indent=2)
 
-        total = len(data)
-        if limit == 0:
-            subset = data[offset:]
-        else:
-            subset = data[offset : offset + limit]
-
-        result = {
-            "site": site.lower(),
-            "table": "xyz",
-            "total_records": total,
-            "offset": offset,
-            "returned": len(subset),
-            "data": subset,
-        }
+        result = _paged_result(site.lower(), "xyz", data, limit, offset, count_only)
         return json.dumps(result, indent=2, default=str)
     except httpx.HTTPStatusError as e:
         return f"HTTP error {e.response.status_code}: {e.response.text}"
@@ -226,7 +285,9 @@ async def get_xyz(site: str, limit: int = 100, offset: int = 0) -> str:
 
 
 @mcp.tool()
-async def get_context(site: str, limit: int = 100, offset: int = 0) -> str:
+async def get_context(
+    site: str, limit: int = 100, offset: int = 0, count_only: bool = False
+) -> str:
     """
     Get context/find data for a site.
 
@@ -234,33 +295,22 @@ async def get_context(site: str, limit: int = 100, offset: int = 0) -> str:
         site: Site code — 'esc', 'gdc', or 'cari'
         limit: Max records to return (default 100, use 0 for all)
         offset: Number of records to skip for pagination
+        count_only: Return just the record count, no data. Cheap way to size a
+            table before pulling it.
     """
     state: AppState = mcp.get_context().request_context.lifespan_context
-    err = _validate_site(site)
+    err = _validate_site(site) or _validate_paging(limit, offset)
     if err:
         return err
 
     try:
-        data = await _authed_get(state, f"{site.lower()}/context/list/")
+        data = await _fetch_table(state, f"{site.lower()}/context/list/")
         if isinstance(data, dict) and "error" in data:
             return data["error"]
         if not isinstance(data, list):
             return json.dumps(data, indent=2)
 
-        total = len(data)
-        if limit == 0:
-            subset = data[offset:]
-        else:
-            subset = data[offset : offset + limit]
-
-        result = {
-            "site": site.lower(),
-            "table": "context",
-            "total_records": total,
-            "offset": offset,
-            "returned": len(subset),
-            "data": subset,
-        }
+        result = _paged_result(site.lower(), "context", data, limit, offset, count_only)
         return json.dumps(result, indent=2, default=str)
     except httpx.HTTPStatusError as e:
         return f"HTTP error {e.response.status_code}: {e.response.text}"
@@ -282,7 +332,7 @@ async def get_datums(site: str) -> str:
         return err
 
     try:
-        data = await _authed_get(state, f"{site.lower()}/datums/list/")
+        data = await _fetch_table(state, f"{site.lower()}/datums/list/")
         if isinstance(data, dict) and "error" in data:
             return data["error"]
 
@@ -300,7 +350,9 @@ async def get_datums(site: str) -> str:
 
 
 @mcp.tool()
-async def get_site_data(site: str, limit: int = 100, offset: int = 0) -> str:
+async def get_site_data(
+    site: str, limit: int = 100, offset: int = 0, count_only: bool = False
+) -> str:
     """
     Get combined XYZ + Context data for a site (left join on squid, unit, idno).
     This mirrors the finisterraR::get_site_data() function.
@@ -309,18 +361,21 @@ async def get_site_data(site: str, limit: int = 100, offset: int = 0) -> str:
         site: Site code — 'esc', 'gdc', or 'cari'
         limit: Max records to return (default 100, use 0 for all)
         offset: Number of records to skip for pagination
+        count_only: Return row counts and join coverage only, no data. The full
+            join is far too large to return in one response, so use this first
+            to size the pull.
     """
     state: AppState = mcp.get_context().request_context.lifespan_context
-    err = _validate_site(site)
+    err = _validate_site(site) or _validate_paging(limit, offset)
     if err:
         return err
 
     try:
-        xyz_data = await _authed_get(state, f"{site.lower()}/xyz/list/")
+        xyz_data = await _fetch_table(state, f"{site.lower()}/xyz/list/")
         if isinstance(xyz_data, dict) and "error" in xyz_data:
             return xyz_data["error"]
 
-        ctx_data = await _authed_get(state, f"{site.lower()}/context/list/")
+        ctx_data = await _fetch_table(state, f"{site.lower()}/context/list/")
         if isinstance(ctx_data, dict) and "error" in ctx_data:
             return ctx_data["error"]
 
@@ -333,30 +388,25 @@ async def get_site_data(site: str, limit: int = 100, offset: int = 0) -> str:
 
         # Left join: xyz as base, merge context fields
         combined = []
+        matched = 0
         if isinstance(xyz_data, list):
             for row in xyz_data:
                 key = (row.get("squid"), row.get("unit"), row.get("idno"))
                 merged = {**row}
                 if key in ctx_lookup:
+                    matched += 1
                     for k, v in ctx_lookup[key].items():
                         if k not in merged:
                             merged[k] = v
                 combined.append(merged)
 
-        total = len(combined)
-        if limit == 0:
-            subset = combined[offset:]
-        else:
-            subset = combined[offset : offset + limit]
-
-        result = {
-            "site": site.lower(),
-            "table": "xyz + context (joined)",
-            "total_records": total,
-            "offset": offset,
-            "returned": len(subset),
-            "data": subset,
-        }
+        result = _paged_result(
+            site.lower(), "xyz + context (joined)", combined, limit, offset, count_only
+        )
+        result["xyz_records"] = len(xyz_data) if isinstance(xyz_data, list) else 0
+        result["context_records"] = len(ctx_data) if isinstance(ctx_data, list) else 0
+        result["joined_with_context"] = matched
+        result["missing_context"] = len(combined) - matched
         return json.dumps(result, indent=2, default=str)
     except httpx.HTTPStatusError as e:
         return f"HTTP error {e.response.status_code}: {e.response.text}"
@@ -384,7 +434,7 @@ async def get_table_schema(site: str, table: str) -> str:
         return f"Unknown table '{table}'. Available tables: {', '.join(KNOWN_TABLES)}"
 
     try:
-        data = await _authed_get(state, f"{site.lower()}/{table}/list/")
+        data = await _fetch_table(state, f"{site.lower()}/{table}/list/")
         if isinstance(data, dict) and "error" in data:
             return data["error"]
         if not isinstance(data, list) or len(data) == 0:
@@ -424,7 +474,7 @@ async def search_by_square(site: str, square_id: str) -> str:
         return err
 
     try:
-        data = await _authed_get(state, f"{site.lower()}/xyz/list/")
+        data = await _fetch_table(state, f"{site.lower()}/xyz/list/")
         if isinstance(data, dict) and "error" in data:
             return data["error"]
         if not isinstance(data, list):
@@ -460,9 +510,9 @@ async def summary_stats(site: str) -> str:
         return err
 
     try:
-        xyz_data = await _authed_get(state, f"{site.lower()}/xyz/list/")
-        ctx_data = await _authed_get(state, f"{site.lower()}/context/list/")
-        datum_data = await _authed_get(state, f"{site.lower()}/datums/list/")
+        xyz_data = await _fetch_table(state, f"{site.lower()}/xyz/list/")
+        ctx_data = await _fetch_table(state, f"{site.lower()}/context/list/")
+        datum_data = await _fetch_table(state, f"{site.lower()}/datums/list/")
 
         summary: dict[str, Any] = {
             "site": site.lower(),

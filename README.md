@@ -12,11 +12,46 @@ MCP (Model Context Protocol) server that gives Claude direct access to the FINIS
 | `get_context` | Context/find data for a site |
 | `get_datums` | Datum points for a site |
 | `get_site_data` | Combined XYZ + Context (joined) — mirrors `finisterraR::get_site_data()` |
+
+`get_xyz`, `get_context`, and `get_site_data` take `limit` (0 = all), `offset`, and
+`count_only`.
 | `get_table_schema` | Inspect field names, types, and a sample record |
 | `search_by_square` | Filter XYZ records by excavation square |
 | `summary_stats` | Quick overview: record counts, squares, coordinate ranges |
 
 Sites: **esc** (Escoural), **gdc** (Gruta da Companheira), **cari** (Carigüela)
+
+## Pagination and caching
+
+The upstream API has **no server-side pagination** — `limit`, `offset`, `page`, and
+field filters are all ignored, and every request returns the entire table. Paging
+therefore happens in this server, over a fetched table.
+
+To stop that from re-downloading the table once per page, fetched tables are cached
+in memory for `FINISTERRA_CACHE_TTL` seconds (default 300; set `0` to disable).
+Walking all 8,409 ESC XYZ records in pages of 500 costs **1 HTTP fetch instead of 17**.
+
+Paged responses carry `has_more` and `next_offset`, so you can walk a table without
+tracking offsets yourself:
+
+```
+get_xyz("esc", limit=500)            -> next_offset: 500, has_more: true
+get_xyz("esc", limit=500, offset=500) -> next_offset: 1000, has_more: true
+```
+
+Use `count_only=True` to size a table before pulling it — it returns just the counts,
+no rows. On `get_site_data` it also reports join coverage
+(`joined_with_context` / `missing_context`):
+
+```
+get_site_data("gdc", count_only=True)
+-> total_records: 3005, xyz_records: 3005, context_records: 2060,
+   joined_with_context: 2975, missing_context: 30
+```
+
+**Response size:** full tables far exceed the MCP response limit (ESC joined is ~4.1M
+characters), so a `limit=0` pull cannot be returned inline. Page it, filter it, or have
+the client write the oversized result to disk.
 
 ## Setup
 
