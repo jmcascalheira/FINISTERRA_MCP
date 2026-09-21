@@ -18,6 +18,7 @@ MCP (Model Context Protocol) server that gives Claude direct access to the FINIS
 | `get_table_schema` | Inspect field names, types, and a sample record |
 | `search_by_square` | Filter XYZ records by excavation square |
 | `list_squares` | Distinct square ids for a site, optionally filtered by unit |
+| `field_summary` | Distinct values and counts for any field in any table |
 | `summary_stats` | Quick overview: record counts, units, coordinate ranges |
 
 Sites: **esc** (Escoural), **gdc** (Gruta da Companheira), **cari** (Carigüela)
@@ -52,6 +53,33 @@ list_squares("gdc", unit="N19")        -> 421 squares, N19-1, N19-10, ...
 
 Likewise `summary_stats` lists datum *names* only; `get_datums` returns their
 coordinates.
+
+## Counting arbitrary fields
+
+The other tools cover sites, squares and units. `field_summary` covers everything
+else — `level`, `spit`, `feature`, `code`, `excavator`, `year` — without paging a
+table into the conversation:
+
+```
+field_summary("esc", "context", "level")
+-> distinct_values: 8, populated: 5342, blank: 18
+   2=2733, 3=1756, 3b=467, 2/3=283, 4=47, 2b=28, 3/3b=15, surf=13
+```
+
+`top` caps how many distinct values come back (default 50, `0` for all), so
+high-cardinality fields like `squid` truncate rather than overflow. Numeric fields
+also get min/max/mean, since a list of 1,769 distinct z-coordinates is rarely useful.
+An unknown field name returns the available ones.
+
+**Placeholder nulls:** values like `NA` are real strings in the database, not nulls,
+so they are counted as populated and reported separately under `null_like`. At ESC
+this matters — `spit` is blank in 4,295 of 5,360 records and its *only* non-blank
+value is the string `NA` (1,065 times); `feature` has 1,063 the same way. Any
+`IS NOT NULL` style query over those fields will overcount badly.
+
+**Levels are not comparable across sites:** ESC has 8 distinct values, GDC 29
+(including `3/1b`, `red_entrance`, `north_profile`) and CARI 90. ESC's `2/3` and
+`3/3b` are dual attributions at a contact rather than layers in their own right.
 
 ## Marker records
 

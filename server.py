@@ -49,6 +49,11 @@ CACHE_TTL = float(os.environ.get("FINISTERRA_CACHE_TTL", "300"))
 # profile or section unit (CARI's corte1/corte2 hold OSL, ochre and lithics).
 MARKER_CODES = {"PHOTO", "TOPOGRAPHY", "TOPO", "POINT"}
 
+# Placeholder strings stored where a null was meant. They are real values as far
+# as the database is concerned, so field_summary reports them separately rather
+# than folding them into the blank count.
+NULL_LIKE = {"NA", "N/A", "NONE", "NULL", "-", "--", "?", "N.A."}
+
 logger = logging.getLogger("finisterra-mcp")
 
 # ---------------------------------------------------------------------------
@@ -568,6 +573,130 @@ async def search_by_square(site: str, square_id: str) -> str:
             "total_matches": len(matches),
             "data": matches,
         }
+        return json.dumps(result, indent=2, default=str)
+    except httpx.HTTPStatusError as e:
+        return f"HTTP error {e.response.status_code}: {e.response.text}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+async def field_summary(
+    site: str,
+    table: str,
+    field: str,
+    top: int = 50,
+    exclude_markers: bool = False,
+) -> str:
+    """
+    Count the distinct values of any field in a table.
+
+    Answers "how many X are there" for fields the other tools do not expose —
+    level, spit, feature, code, excavator, year and so on — without pulling the
+    table into the conversation.
+
+    Args:
+        site: Site code — 'esc', 'gdc', or 'cari'
+        table: Table name — 'xyz', 'context', or 'datums'
+        field: Field to summarise. An unknown name returns the available fields.
+        top: Max distinct values to return, most frequent first (default 50,
+            use 0 for all). High-cardinality fields like squid will be truncated.
+        exclude_markers: Ignore PHOTO/TOPOGRAPHY/POINT records. Ignored for the
+            datums table, which has no context codes.
+
+    Numeric fields also get min/max/mean, since a list of distinct coordinates
+    is rarely what you want.
+    """
+    state: AppState = mcp.get_context().request_context.lifespan_context
+    err = _validate_site(site)
+    if err:
+        return err
+
+    table = table.lower().strip()
+    if table not in KNOWN_TABLES:
+        return f"Unknown table '{table}'. Available tables: {', '.join(KNOWN_TABLES)}"
+    if top < 0:
+        return f"Invalid top {top}. Use a positive number, or 0 for all values."
+
+    try:
+        data = await _fetch_table(state, f"{site.lower()}/{table}/list/")
+        if isinstance(data, dict) and "error" in data:
+            return data["error"]
+        if not isinstance(data, list) or not data:
+            return f"No data found in {site.lower()}/{table}."
+
+        available = sorted({k for row in data if isinstance(row, dict) for k in row})
+        if field not in available:
+            return (
+                f"Unknown field '{field}' in {site.lower()}/{table}. "
+                f"Available fields: {', '.join(available)}"
+            )
+
+        notes = []
+        dropped = 0
+        if exclude_markers:
+            if table == "datums":
+                notes.append("exclude_markers ignored: the datums table has no context codes.")
+            elif table == "context":
+                before = len(data)
+                data = [r for r in data if not _is_marker_code(r.get("code"))]
+                dropped = before - len(data)
+            else:
+                data, dropped = await _xyz_without_markers(state, site.lower(), data)
+
+        total = len(data)
+        counts: dict[str, int] = {}
+        blank = 0
+        numeric_vals: list[float] = []
+        all_numeric = True
+
+        for row in data:
+            raw = row.get(field)
+            if raw is None or str(raw).strip() == "":
+                blank += 1
+                continue
+            key = str(raw).strip()
+            counts[key] = counts.get(key, 0) + 1
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                all_numeric = False
+            else:
+                numeric_vals.append(float(raw))
+
+        ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        shown = ordered if top == 0 else ordered[:top]
+
+        result: dict[str, Any] = {
+            "site": site.lower(),
+            "table": table,
+            "field": field,
+            "total_records": total,
+            "populated": total - blank,
+            "blank": blank,
+            "distinct_values": len(counts),
+            "returned": len(shown),
+            "truncated": len(shown) < len(counts),
+            "values": [{"value": v, "count": n} for v, n in shown],
+        }
+
+        null_like = {v: n for v, n in ordered if v.upper() in NULL_LIKE}
+        if null_like:
+            result["null_like"] = null_like
+            result["null_like_note"] = (
+                "These are placeholder strings, not nulls. They are counted as "
+                "populated values above; treat them as missing data."
+            )
+
+        if all_numeric and numeric_vals:
+            result["numeric"] = {
+                "min": min(numeric_vals),
+                "max": max(numeric_vals),
+                "mean": round(sum(numeric_vals) / len(numeric_vals), 3),
+            }
+
+        if exclude_markers and table != "datums":
+            result["markers_excluded"] = dropped
+        if notes:
+            result["notes"] = notes
         return json.dumps(result, indent=2, default=str)
     except httpx.HTTPStatusError as e:
         return f"HTTP error {e.response.status_code}: {e.response.text}"
