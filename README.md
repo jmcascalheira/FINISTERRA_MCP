@@ -20,6 +20,8 @@ MCP (Model Context Protocol) server that gives Claude direct access to the FINIS
 | `list_squares` | Distinct square ids for a site, optionally filtered by unit |
 | `field_summary` | Distinct values and counts for any field in any table |
 | `summary_stats` | Quick overview: record counts, units, coordinate ranges |
+| `add_record` | Add a context, xyz or datums record (off unless writes are enabled) |
+| `update_record` | Change fields on one existing record (off unless writes are enabled) |
 
 Sites: **esc** (Escoural), **gdc** (Gruta da Companheira), **cari** (Carigüela)
 
@@ -118,6 +120,47 @@ get_site_data("gdc", count_only=True)
 characters), so a `limit=0` pull cannot be returned inline. Page it, filter it, or have
 the client write the oversized result to disk.
 
+## Writing to the database
+
+`add_record` and `update_record` use the API's `create/` and `update/<pk>/`
+endpoints. They are **disabled unless the server runs with
+`FINISTERRA_ALLOW_WRITES=1`**, and both default to `dry_run=True`, which validates
+the change and shows exactly what would be sent without writing anything.
+
+```
+add_record("esc", "context", {"squid": "N19-2041", "unit": "N19", "idno": "2041", "code": "LITHIC"})
+-> dry_run: true, method: POST, path: esc/context/create/, payload: {...}
+
+update_record("esc", "xyz", {"squid": "N19-2041", "suffix": 0}, {"z": -1.234})
+-> dry_run: true, method: PATCH, path: esc/xyz/update/8123/,
+   changes: {z: {from: -1.243, to: -1.234}}
+```
+
+Pass `dry_run=False` to write. The API has **no delete endpoint**, so a wrong
+record can only be fixed with another update (or in the Django admin).
+
+Records are identified by their natural key: context by `squid`, xyz by
+`squid` + `suffix`, datums by `name`. Before writing, the tools re-fetch the table
+(bypassing the cache) and:
+
+- refuse an add whose key already exists, and an update unless the key matches
+  exactly one record;
+- reject unknown fields, and refuse to change key fields (changing a primary key
+  through the API inserts a new row instead of renaming the old one);
+- for xyz adds, require the `squid` to exist in the context table, and copy
+  `unit`/`idno` from it when omitted.
+
+After a successful write, all of that site's cached tables are dropped, so reads
+see the change immediately. Server-side validation errors come back verbatim.
+
+**CARI xyz and datums writes are blocked.** In the backend's `api/serializers.py`,
+`cari_XYZSerializer` and `cari_DatumsSerializer` are bound to the ESC models, so a
+CARI create would land in the ESC database. CARI context writes are unaffected.
+Remove the entries from `BLOCKED_WRITES` in `server.py` once the backend is fixed.
+
+The API grants write access to any authenticated user, so the environment variable
+is the only thing keeping a read-only setup read-only.
+
 ## Setup
 
 ### 1. Install dependencies
@@ -139,6 +182,8 @@ export FINISTERRA_PASSWORD="your_password"
 ```
 
 Or authenticate manually via the `authenticate` tool after connecting.
+
+To enable the write tools, also set `FINISTERRA_ALLOW_WRITES=1`.
 
 ### 3. Add to Claude
 

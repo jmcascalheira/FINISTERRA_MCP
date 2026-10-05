@@ -11,6 +11,8 @@ CARI (Carigüela).
 Authentication via environment variables:
     FINISTERRA_USERNAME
     FINISTERRA_PASSWORD
+
+Writes (add_record, update_record) are disabled unless FINISTERRA_ALLOW_WRITES=1.
 """
 
 import os
@@ -20,6 +22,7 @@ import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -53,6 +56,46 @@ MARKER_CODES = {"PHOTO", "TOPOGRAPHY", "TOPO", "POINT"}
 # as the database is concerned, so field_summary reports them separately rather
 # than folding them into the blank count.
 NULL_LIKE = {"NA", "N/A", "NONE", "NULL", "-", "--", "?", "N.A."}
+
+# Writes are off unless explicitly enabled, so a read-only setup stays read-only.
+ALLOW_WRITES = os.environ.get("FINISTERRA_ALLOW_WRITES", "").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+
+# Writable fields per table, from the backend models (finisterra/models.py).
+# "id" is server-assigned and never sent.
+WRITABLE_FIELDS = {
+    "context": {
+        "squid", "unit", "idno", "sitename", "code", "excavator", "level",
+        "spit", "feature", "date", "year", "notes",
+    },
+    "xyz": {"squid", "unit", "idno", "suffix", "prism", "x", "y", "z", "notes"},
+    "datums": {"name", "x", "y", "z", "date", "notes"},
+}
+
+# Natural key of each table. Context's key is also its primary key; XYZ and
+# datums are addressed by an auto id that we resolve from the key. Key fields
+# can't be changed by update_record: changing a primary key through the API
+# inserts a new row rather than renaming the old one.
+KEY_FIELDS = {
+    "context": ("squid",),
+    "xyz": ("squid", "suffix"),
+    "datums": ("name",),
+}
+
+REQUIRED_ON_CREATE = {
+    "context": ("squid",),
+    "xyz": ("squid", "suffix"),
+    "datums": ("name", "x", "y", "z"),
+}
+
+# Upstream bug: cari_XYZSerializer and cari_DatumsSerializer in the backend's
+# api/serializers.py are bound to the ESC models, so a create would land in the
+# ESC database and an update validates against ESC rows. Refuse until fixed.
+BLOCKED_WRITES = {
+    ("cari", "xyz"): "the backend's cari_XYZSerializer is bound to the ESC XYZ model",
+    ("cari", "datums"): "the backend's cari_DatumsSerializer is bound to the ESC Datums model",
+}
 
 logger = logging.getLogger("finisterra-mcp")
 
@@ -112,7 +155,10 @@ mcp = FastMCP(
         "archaeological excavation data (XYZ coordinates, context/find "
         "records, datums) for sites: ESC (Escoural), GDC (Gruta da "
         "Companheira), CARI (Carigüela). Authenticate first if credentials "
-        "were not provided via environment variables."
+        "were not provided via environment variables. add_record and "
+        "update_record write to the live database: they default to a dry run, "
+        "so show the user the preview and only pass dry_run=False once they "
+        "have confirmed it."
     ),
     lifespan=lifespan,
 )
@@ -154,6 +200,62 @@ async def _fetch_table(state: AppState, path: str, refresh: bool = False) -> Any
     if isinstance(data, list) and CACHE_TTL > 0:
         state.cache[path] = (now, data)
     return data
+
+
+async def _authed_send(state: AppState, method: str, path: str, payload: dict) -> Any:
+    """Make an authenticated write request. Returns parsed JSON, or an error dict
+    carrying the server's validation message on a 4xx."""
+    if not state.token:
+        return {"error": "Not authenticated. Call the authenticate tool first."}
+    if not state.client:
+        return {"error": "HTTP client not initialised."}
+
+    url = f"{BASE_URL}/{path.lstrip('/')}"
+    resp = await state.client.request(
+        method, url, json=payload, headers={"Authorization": f"Token {state.token}"}
+    )
+    if 400 <= resp.status_code < 500:
+        try:
+            detail = resp.json()
+        except ValueError:
+            detail = resp.text
+        return {"error": f"HTTP {resp.status_code} from {method} {path}", "detail": detail}
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _invalidate_site(state: AppState, site: str) -> None:
+    """Drop every cached table for a site. A context write changes the XYZ join
+    and marker filtering too, so clearing per-table isn't enough."""
+    for path in [p for p in state.cache if p.startswith(f"{site}/")]:
+        del state.cache[path]
+
+
+def _key_matches(row: dict, table: str, key: dict) -> bool:
+    """True if a row's natural-key fields equal the given key (string compare,
+    so suffix 1 and "1" match)."""
+    return all(str(row.get(k)) == str(key[k]) for k in KEY_FIELDS[table])
+
+
+def _validate_write(site: str, table: str) -> str | None:
+    """Return an error message if writes to site/table aren't allowed, else None."""
+    if not ALLOW_WRITES:
+        return (
+            "Writes are disabled. Set FINISTERRA_ALLOW_WRITES=1 in the server's "
+            "environment to enable add_record and update_record."
+        )
+    err = _validate_site(site)
+    if err:
+        return err
+    if table not in WRITABLE_FIELDS:
+        return f"Unknown table '{table}'. Writable tables: {', '.join(WRITABLE_FIELDS)}"
+    blocked = BLOCKED_WRITES.get((site, table))
+    if blocked:
+        return (
+            f"Writes to {site}/{table} are blocked: {blocked}, so the write would "
+            "hit the wrong site. Fix the serializer upstream first."
+        )
+    return None
 
 
 def _is_marker_code(code: Any) -> bool:
@@ -865,6 +967,205 @@ async def summary_stats(site: str, exclude_markers: bool = False) -> str:
             summary["datums"] = {"total_records": 0}
 
         return json.dumps(summary, indent=2, default=str)
+    except httpx.HTTPStatusError as e:
+        return f"HTTP error {e.response.status_code}: {e.response.text}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Write tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def add_record(
+    site: str,
+    table: str,
+    record: dict[str, Any],
+    dry_run: bool = True,
+) -> str:
+    """
+    Add a new record to a site's context, xyz or datums table.
+
+    Disabled unless the server runs with FINISTERRA_ALLOW_WRITES=1. Defaults to a
+    dry run: it validates the record and shows exactly what would be sent. Call
+    again with dry_run=False to write. There is no delete, so check the dry run.
+
+    Args:
+        site: Site code — 'esc', 'gdc', or 'cari'
+        table: 'context', 'xyz', or 'datums'
+        record: Field values. Required: context → squid; xyz → squid, suffix;
+            datums → name, x, y, z. An xyz record's squid must already exist in
+            the context table; its unit/idno are copied from that context
+            record when omitted.
+        dry_run: Validate and preview without writing (default True)
+    """
+    state: AppState = mcp.get_context().request_context.lifespan_context
+    site, table = site.lower().strip(), table.lower().strip()
+    err = _validate_write(site, table)
+    if err:
+        return err
+
+    unknown = sorted(set(record) - WRITABLE_FIELDS[table])
+    if unknown:
+        return (
+            f"Unknown field(s) for {table}: {', '.join(unknown)}. "
+            f"Writable fields: {', '.join(sorted(WRITABLE_FIELDS[table]))}"
+        )
+    missing = [f for f in REQUIRED_ON_CREATE[table] if record.get(f) in (None, "")]
+    if missing:
+        return f"Missing required field(s) for {table}: {', '.join(missing)}"
+
+    try:
+        # Fresh reads: a duplicate check against a 5-minute-old cache isn't one.
+        rows = await _fetch_table(state, f"{site}/{table}/list/", refresh=True)
+        if isinstance(rows, dict) and "error" in rows:
+            return rows["error"]
+
+        key = {k: record[k] for k in KEY_FIELDS[table]}
+        existing = [r for r in rows if _key_matches(r, table, key)]
+        if existing:
+            return json.dumps({
+                "error": f"A {table} record with {key} already exists. Use update_record to change it.",
+                "existing": existing[0],
+            }, indent=2, default=str)
+
+        payload = dict(record)
+        warnings = []
+        if table == "xyz":
+            ctx_rows = await _fetch_table(state, f"{site}/context/list/", refresh=True)
+            if isinstance(ctx_rows, dict) and "error" in ctx_rows:
+                return ctx_rows["error"]
+            ctx = next((r for r in ctx_rows if str(r.get("squid")) == str(record["squid"])), None)
+            if ctx is None:
+                return (
+                    f"No context record with squid '{record['squid']}' at {site}. "
+                    "XYZ rows reference a context record; add that first."
+                )
+            for f in ("unit", "idno"):
+                if payload.get(f) in (None, ""):
+                    payload[f] = ctx.get(f)
+                elif str(payload[f]) != str(ctx.get(f)):
+                    warnings.append(
+                        f"{f} '{payload[f]}' differs from the context record's '{ctx.get(f)}'."
+                    )
+
+        path = f"{site}/{table}/create/"
+        result: dict[str, Any] = {"site": site, "table": table, "method": "POST", "path": path}
+        if warnings:
+            result["warnings"] = warnings
+
+        if dry_run:
+            result["dry_run"] = True
+            result["payload"] = payload
+            result["note"] = "Nothing written. Call again with dry_run=False to create this record."
+            return json.dumps(result, indent=2, default=str)
+
+        created = await _authed_send(state, "POST", path, payload)
+        if isinstance(created, dict) and "error" in created:
+            return json.dumps(created, indent=2, default=str)
+        _invalidate_site(state, site)
+        result["created"] = created
+        return json.dumps(result, indent=2, default=str)
+    except httpx.HTTPStatusError as e:
+        return f"HTTP error {e.response.status_code}: {e.response.text}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+async def update_record(
+    site: str,
+    table: str,
+    key: dict[str, Any],
+    fields: dict[str, Any],
+    dry_run: bool = True,
+) -> str:
+    """
+    Change fields on one existing record in a site's context, xyz or datums table.
+
+    Disabled unless the server runs with FINISTERRA_ALLOW_WRITES=1. Defaults to a
+    dry run that shows the current values next to the new ones. Call again with
+    dry_run=False to write. Only the given fields are changed.
+
+    Args:
+        site: Site code — 'esc', 'gdc', or 'cari'
+        table: 'context', 'xyz', or 'datums'
+        key: Identifies the record — context: {"squid": ...};
+            xyz: {"squid": ..., "suffix": ...}; datums: {"name": ...}
+        fields: Field values to set. Key fields can't be changed here.
+        dry_run: Validate and preview without writing (default True)
+    """
+    state: AppState = mcp.get_context().request_context.lifespan_context
+    site, table = site.lower().strip(), table.lower().strip()
+    err = _validate_write(site, table)
+    if err:
+        return err
+
+    key_fields = KEY_FIELDS[table]
+    if set(key) != set(key_fields):
+        return f"key for {table} must have exactly: {', '.join(key_fields)}"
+    if not fields:
+        return "No fields given to update."
+    unknown = sorted(set(fields) - WRITABLE_FIELDS[table])
+    if unknown:
+        return (
+            f"Unknown field(s) for {table}: {', '.join(unknown)}. "
+            f"Writable fields: {', '.join(sorted(WRITABLE_FIELDS[table]))}"
+        )
+    locked = sorted(set(fields) & set(key_fields))
+    if locked:
+        return (
+            f"Can't change key field(s) {', '.join(locked)} with update_record: the "
+            "API would insert a new row instead of renaming this one."
+        )
+
+    try:
+        rows = await _fetch_table(state, f"{site}/{table}/list/", refresh=True)
+        if isinstance(rows, dict) and "error" in rows:
+            return rows["error"]
+
+        matches = [r for r in rows if _key_matches(r, table, key)]
+        if len(matches) != 1:
+            return f"Expected exactly one {table} record matching {key}, found {len(matches)}."
+        current = matches[0]
+
+        pk = current.get("squid") if table == "context" else current.get("id")
+        if pk is None:
+            return f"The matched {table} record has no primary key in the API response; can't update it."
+
+        changes = {
+            f: {"from": current.get(f), "to": v}
+            for f, v in fields.items()
+            if str(current.get(f)) != str(v)
+        }
+        if not changes:
+            return json.dumps({"note": "No changes: the record already has these values.", "current": current},
+                              indent=2, default=str)
+
+        payload = {f: fields[f] for f in changes}
+        path = f"{site}/{table}/update/{quote(str(pk), safe='')}/"
+        result: dict[str, Any] = {
+            "site": site, "table": table, "key": key,
+            "method": "PATCH", "path": path, "changes": changes,
+        }
+        if table == "xyz" and {"unit", "idno"} & set(payload):
+            result["warnings"] = [
+                "unit/idno are also stored on the context record; changing them here "
+                "can make this row disagree with its context."
+            ]
+
+        if dry_run:
+            result["dry_run"] = True
+            result["note"] = "Nothing written. Call again with dry_run=False to apply."
+            return json.dumps(result, indent=2, default=str)
+
+        updated = await _authed_send(state, "PATCH", path, payload)
+        if isinstance(updated, dict) and "error" in updated:
+            return json.dumps(updated, indent=2, default=str)
+        _invalidate_site(state, site)
+        result["updated"] = updated
+        return json.dumps(result, indent=2, default=str)
     except httpx.HTTPStatusError as e:
         return f"HTTP error {e.response.status_code}: {e.response.text}"
     except Exception as e:
